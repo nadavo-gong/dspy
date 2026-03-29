@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # Do not add spaces around the '=' sign for any of the fields
 # preceded by a marker comment as it affects the publish workflow.
 #replace_package_name_marker
-name="dspy"
+name="dspy-nolitellm"
 #replace_package_version_marker
 version="3.2.0"
 description = "DSPy"
