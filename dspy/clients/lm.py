@@ -5,11 +5,15 @@ import threading
 import warnings
 from typing import Any, Literal, cast
 
-import litellm
+try:
+    import litellm
+    from litellm import ContextWindowExceededError as LitellmContextWindowExceededError
+except ImportError:
+    litellm = None
+    LitellmContextWindowExceededError = None
 import pydantic
 from anyio.streams.memory import MemoryObjectSendStream
 from asyncer import syncify
-from litellm import ContextWindowExceededError as LitellmContextWindowExceededError
 
 import dspy
 from dspy.clients.cache import request_cache

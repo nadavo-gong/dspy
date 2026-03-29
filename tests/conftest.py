@@ -1,9 +1,19 @@
 import copy
 import os
+import warnings
 
 import pytest
 
-from tests.test_utils.server import litellm_test_server, read_litellm_test_server_request_logs  # noqa: F401
+try:
+    from tests.test_utils.server import litellm_test_server, read_litellm_test_server_request_logs  # noqa: F401
+except ImportError:
+    warnings.warn(
+        "litellm is not installed -- litellm_test_server / "
+        "read_litellm_test_server_request_logs fixtures are unavailable, and "
+        "tests that depend on them will be skipped.",
+        stacklevel=2,
+    )
+
 
 SKIP_DEFAULT_FLAGS = ["reliability", "extra", "llm_call", "deno"]
 

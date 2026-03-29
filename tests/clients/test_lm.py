@@ -6,11 +6,15 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
-import litellm
 import pydantic
 import pytest
-from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
-from litellm.utils import Choices, Message, ModelResponse
+
+try:
+    import litellm
+    from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
+    from litellm.utils import Choices, Message, ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 from openai import RateLimitError
 from openai.types.responses import ResponseOutputMessage, ResponseReasoningItem
 from openai.types.responses.response_reasoning_item import Summary

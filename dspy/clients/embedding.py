@@ -1,6 +1,9 @@
 from typing import Any, Callable
 
-import litellm
+try:
+    import litellm
+except ImportError:
+    litellm = None
 import numpy as np
 
 from dspy.clients.cache import request_cache

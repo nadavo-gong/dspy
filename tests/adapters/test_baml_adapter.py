@@ -3,8 +3,12 @@ from unittest import mock
 
 import pydantic
 import pytest
-from litellm import Choices, Message
-from litellm.files.main import ModelResponse
+
+try:
+    from litellm import Choices, Message
+    from litellm.files.main import ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy.adapters.baml_adapter import COMMENT_SYMBOL, INDENTATION, BAMLAdapter

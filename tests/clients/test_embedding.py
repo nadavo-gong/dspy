@@ -3,6 +3,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+try:
+    import litellm  # noqa: F401
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
+
 import dspy
 from dspy.clients.embedding import Embedder
 

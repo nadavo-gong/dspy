@@ -5,7 +5,10 @@ from queue import Queue
 from typing import TYPE_CHECKING, Any
 
 import jiter
-from litellm import ModelResponseStream
+try:
+    from litellm import ModelResponseStream
+except ImportError:
+    ModelResponseStream = None
 
 from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.adapters.json_adapter import JSONAdapter

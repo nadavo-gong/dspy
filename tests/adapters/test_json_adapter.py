@@ -2,9 +2,13 @@ from unittest import mock
 
 import pydantic
 import pytest
-from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
-from litellm.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
 from openai.types.responses import ResponseOutputMessage
+
+try:
+    from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
+    from litellm.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 
