@@ -4,24 +4,29 @@ Uses mocked ``BaseChatModel`` instances -- no real LangChain provider is
 invoked.
 """
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from openai.types.chat import ChatCompletion
 
 from dspy.clients.langchain_lm import (
     LangChainLM,
+    _DEFAULT_BIND_PARAMS,
     _extract_langchain_params,
     _is_context_window_error,
     _to_langchain_messages,
-    _translate_params_for_provider,
+    translate_azure,
+    translate_bedrock,
+    translate_vertex,
 )
 from dspy.clients.langchain_openai_compat import (
     _extract_finish_reason,
     _extract_reasoning_content,
     _extract_text_content,
+    _extract_tool_calls,
     langchain_to_openai_completion,
 )
 from dspy.utils.exceptions import ContextWindowExceededError
@@ -108,6 +113,52 @@ def test_extract_text_returns_empty_for_missing_content():
 
 
 # ---------------------------------------------------------------------------
+# _extract_tool_calls + tool-call round-tripping
+# ---------------------------------------------------------------------------
+
+
+def test_extract_tool_calls_translates_langchain_shape_to_openai():
+    msg = AIMessage(
+        content="",
+        tool_calls=[{"id": "c1", "name": "get_weather", "args": {"city": "Tokyo"}}],
+    )
+    tool_calls = _extract_tool_calls(msg)
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].id == "c1"
+    assert tool_calls[0].type == "function"
+    assert tool_calls[0].function.name == "get_weather"
+    assert json.loads(tool_calls[0].function.arguments) == {"city": "Tokyo"}
+
+
+def test_extract_tool_calls_returns_none_when_absent():
+    assert _extract_tool_calls(AIMessage(content="x")) is None
+
+
+def test_tool_calls_surface_on_completion_and_finish_reason_is_tool_calls():
+    msg = AIMessage(
+        content="",
+        tool_calls=[{"id": "c1", "name": "f", "args": {"x": 1}}],
+    )
+    resp = langchain_to_openai_completion(msg, model="openai/gpt-4o")
+    choice = resp.choices[0]
+    assert choice.message.tool_calls is not None
+    assert choice.message.tool_calls[0].function.name == "f"
+    assert choice.finish_reason == "tool_calls"
+
+
+def test_tool_calls_missing_id_gets_synthetic_id():
+    # LangChain itself requires ``id`` (possibly ``None``), so emulate the
+    # blank-id case that can arise when a provider returns an empty string.
+    msg = AIMessage(
+        content="",
+        tool_calls=[{"id": "", "name": "f", "args": {}}],
+    )
+    tool_calls = _extract_tool_calls(msg)
+    assert tool_calls[0].id.startswith("call_")
+
+
+# ---------------------------------------------------------------------------
 # _extract_finish_reason
 # ---------------------------------------------------------------------------
 
@@ -122,6 +173,7 @@ def test_extract_text_returns_empty_for_missing_content():
         ("MAX_TOKENS", "length"),
         ("SAFETY", "content_filter"),
         ("tool_calls", "tool_calls"),
+        ("tool_use", "tool_calls"),
         ("unknown_value", "stop"),
     ],
 )
@@ -133,6 +185,11 @@ def test_finish_reason_normalization(raw, expected):
 def test_finish_reason_falls_back_to_stop_reason():
     msg = AIMessage(content="x", response_metadata={"stop_reason": "end_turn"})
     assert _extract_finish_reason(msg) == "stop"
+
+
+def test_finish_reason_coerces_to_tool_calls_when_tool_calls_present():
+    msg = AIMessage(content="", response_metadata={"finish_reason": "stop"})
+    assert _extract_finish_reason(msg, has_tool_calls=True) == "tool_calls"
 
 
 # ---------------------------------------------------------------------------
@@ -158,14 +215,25 @@ def test_reasoning_from_azure_reasoning_content():
     assert _extract_reasoning_content(msg) == "chain of thought"
 
 
-def test_reasoning_from_gemini_block_content():
+def test_reasoning_from_gemini_text_block_under_thinking_type():
+    # Real Vertex output puts the text under "text", not "thinking".
     msg = AIMessage(
         content=[
             {"type": "text", "text": "final"},
-            {"type": "thinking", "thinking": "inner monologue"},
+            {"type": "thinking", "text": "inner monologue"},
         ]
     )
     assert _extract_reasoning_content(msg) == "inner monologue"
+
+
+def test_reasoning_from_gemini_legacy_thinking_key():
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "final"},
+            {"type": "thinking", "thinking": "legacy key"},
+        ]
+    )
+    assert _extract_reasoning_content(msg) == "legacy key"
 
 
 def test_reasoning_returns_none_when_absent():
@@ -195,44 +263,88 @@ def test_to_langchain_messages_maps_roles():
     assert [m.content for m in result] == ["sys", "hi", "hello"]
 
 
+def test_to_langchain_messages_accepts_tool_role():
+    result = _to_langchain_messages(
+        [{"role": "tool", "content": "42", "tool_call_id": "c1"}]
+    )
+    assert isinstance(result[0], ToolMessage)
+    assert result[0].content == "42"
+    assert result[0].tool_call_id == "c1"
+
+
+def test_to_langchain_messages_converts_assistant_tool_calls():
+    result = _to_langchain_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city": "Tokyo"}'},
+                    }
+                ],
+            }
+        ]
+    )
+    ai = result[0]
+    assert ai.tool_calls[0]["id"] == "c1"
+    assert ai.tool_calls[0]["name"] == "get_weather"
+    assert ai.tool_calls[0]["args"] == {"city": "Tokyo"}
+
+
 def test_to_langchain_messages_rejects_unknown_role():
     with pytest.raises(ValueError, match="Unknown message role"):
-        _to_langchain_messages([{"role": "tool", "content": "x"}])
+        _to_langchain_messages([{"role": "alien", "content": "x"}])
 
 
 # ---------------------------------------------------------------------------
-# _extract_langchain_params / _translate_params_for_provider
+# _extract_langchain_params
 # ---------------------------------------------------------------------------
 
 
 def test_extract_langchain_params_filters_unknown_and_none():
     extracted = _extract_langchain_params(
-        {"temperature": 0.2, "max_tokens": 100, "nonsense": "x", "stop": None}
+        {"temperature": 0.2, "max_tokens": 100, "nonsense": "x", "stop": None},
+        _DEFAULT_BIND_PARAMS,
     )
     assert extracted == {"temperature": 0.2, "max_tokens": 100}
 
 
-def test_translate_params_for_vertex_renames_max_tokens():
-    out = _translate_params_for_provider({"max_tokens": 100}, "vertex_ai/gemini-2.5-flash")
-    assert out == {"max_output_tokens": 100}
+def test_extract_langchain_params_respects_custom_allowlist():
+    extracted = _extract_langchain_params(
+        {"temperature": 0.2, "reasoning_effort": "high"},
+        _DEFAULT_BIND_PARAMS | {"reasoning_effort"},
+    )
+    assert extracted == {"temperature": 0.2, "reasoning_effort": "high"}
 
 
-def test_translate_params_for_azure_renames_max_tokens():
-    out = _translate_params_for_provider({"max_tokens": 100}, "azure/gpt-5")
-    assert out == {"max_completion_tokens": 100}
+# ---------------------------------------------------------------------------
+# Built-in parameter translators
+# ---------------------------------------------------------------------------
 
 
-def test_translate_params_for_bedrock_drops_unsupported():
-    out = _translate_params_for_provider(
+def test_translate_vertex_renames_max_tokens():
+    assert translate_vertex({"max_tokens": 100}) == {"max_output_tokens": 100}
+
+
+def test_translate_azure_renames_max_tokens():
+    assert translate_azure({"max_tokens": 100}) == {"max_completion_tokens": 100}
+
+
+def test_translate_bedrock_drops_unsupported():
+    out = translate_bedrock(
         {"max_tokens": 100, "reasoning_effort": "high", "response_format": {"type": "json"}},
-        "bedrock/anthropic.claude-sonnet-4",
     )
     assert out == {"max_tokens": 100}
 
 
-def test_translate_params_does_not_mutate_input():
+def test_translators_do_not_mutate_input():
     params = {"max_tokens": 100}
-    _translate_params_for_provider(params, "vertex_ai/gemini-2.5-flash")
+    translate_vertex(params)
+    translate_azure(params)
+    translate_bedrock(params)
     assert params == {"max_tokens": 100}
 
 
@@ -281,7 +393,6 @@ def test_forward_routes_through_langchain_and_returns_chat_completion():
     lm = LangChainLM(model="openai/gpt-4o", langchain_model=mock_model, cache=False)
     resp = lm.forward(messages=[{"role": "user", "content": "hi"}], temperature=0.1)
 
-    # Per-call temperature overrides BaseLM's default; max_tokens defaults to 1000.
     mock_model.bind.assert_called_once()
     bind_kwargs = mock_model.bind.call_args.kwargs
     assert bind_kwargs["temperature"] == 0.1
@@ -297,12 +408,48 @@ def test_forward_binds_default_params_from_base_lm():
     lm = LangChainLM(model="openai/gpt-4o", langchain_model=mock_model, cache=False)
     lm.forward(messages=[{"role": "user", "content": "hi"}])
 
-    # BaseLM seeds self.kwargs with temperature + max_tokens, so bind is always called.
     mock_model.bind.assert_called_once()
     bind_kwargs = mock_model.bind.call_args.kwargs
     assert "temperature" in bind_kwargs
     assert "max_tokens" in bind_kwargs
     mock_model.invoke.assert_called_once()
+
+
+def test_forward_passes_bind_params_through_translator():
+    ai = AIMessage(content="x", usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+    mock_model = _make_mock_chat_model(ai)
+
+    received: list[dict] = []
+
+    def translator(params):
+        received.append(dict(params))
+        return {"custom_key": 42}
+
+    lm = LangChainLM(
+        model="vendor/model",
+        langchain_model=mock_model,
+        cache=False,
+        param_translator=translator,
+    )
+    lm.forward(messages=[{"role": "user", "content": "hi"}], temperature=0.3)
+
+    assert received and received[0]["temperature"] == 0.3
+    mock_model.bind.assert_called_once_with(custom_key=42)
+
+
+def test_forward_honors_custom_bind_params():
+    ai = AIMessage(content="x", usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+    mock_model = _make_mock_chat_model(ai)
+
+    lm = LangChainLM(
+        model="openai/o3-mini",
+        langchain_model=mock_model,
+        cache=False,
+        bind_params=_DEFAULT_BIND_PARAMS | {"reasoning_effort"},
+    )
+    lm.forward(messages=[{"role": "user", "content": "hi"}], reasoning_effort="high")
+
+    assert mock_model.bind.call_args.kwargs["reasoning_effort"] == "high"
 
 
 def test_forward_raises_context_window_exceeded():
@@ -330,19 +477,49 @@ def test_forward_preserves_unrelated_exceptions():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("model_name", "expected"),
-    [
-        ("openai/gpt-5", True),
-        ("vertex_ai/gemini-2.5-flash", True),
-        ("bedrock/anthropic.claude-sonnet-4", True),
-        ("openai/o3-mini", True),
-        ("openai/gpt-4o", False),
-    ],
-)
-def test_supports_reasoning_matches_known_models(model_name, expected):
-    lm = LangChainLM(model=model_name, langchain_model=MagicMock(spec=BaseChatModel))
-    assert lm.supports_reasoning is expected
+def test_supports_function_calling_defaults_to_introspection():
+    # MagicMock(spec=BaseChatModel) *does* expose bind_tools because it's on
+    # the BaseChatModel spec -- so this introspects True.
+    model = MagicMock(spec=BaseChatModel)
+    lm = LangChainLM(model="openai/gpt-4o", langchain_model=model)
+    assert lm.supports_function_calling is True
+
+
+def test_supports_function_calling_introspection_negative_when_method_missing():
+    # A minimal object without bind_tools triggers the False branch.
+    class Minimal:
+        pass
+
+    lm = LangChainLM(model="custom/m", langchain_model=Minimal())
+    assert lm.supports_function_calling is False
+
+
+def test_supports_reasoning_is_false_by_default():
+    lm = LangChainLM(model="openai/gpt-4o", langchain_model=MagicMock(spec=BaseChatModel))
+    assert lm.supports_reasoning is False
+
+
+def test_capability_overrides_stick():
+    lm = LangChainLM(
+        model="openai/o3-mini",
+        langchain_model=MagicMock(spec=BaseChatModel),
+        supports_function_calling=False,
+        supports_response_schema=False,
+        supports_reasoning=True,
+    )
+    assert lm.supports_function_calling is False
+    assert lm.supports_response_schema is False
+    assert lm.supports_reasoning is True
+
+
+def test_supported_params_reports_bind_params():
+    lm = LangChainLM(
+        model="openai/o3-mini",
+        langchain_model=MagicMock(spec=BaseChatModel),
+        bind_params=_DEFAULT_BIND_PARAMS | {"reasoning_effort"},
+    )
+    assert "reasoning_effort" in lm.supported_params
+    assert "temperature" in lm.supported_params
 
 
 def test_copy_preserves_langchain_model_and_updates_kwargs():
@@ -355,3 +532,31 @@ def test_copy_preserves_langchain_model_and_updates_kwargs():
     assert lm2.kwargs["temperature"] == 0.9
     # original should be unchanged
     assert lm.kwargs["temperature"] == 0.5
+
+
+def test_copy_preserves_capability_flags_and_translator():
+    translator = lambda p: p
+    lm = LangChainLM(
+        model="openai/o3-mini",
+        langchain_model=MagicMock(spec=BaseChatModel),
+        supports_reasoning=True,
+        bind_params={"temperature", "reasoning_effort"},
+        param_translator=translator,
+    )
+    lm2 = lm.copy(temperature=0.2)
+    assert lm2.supports_reasoning is True
+    assert lm2._bind_params == {"temperature", "reasoning_effort"}
+    assert lm2._param_translator is translator
+
+
+# ---------------------------------------------------------------------------
+# Smoke test: assert the built-in message classes are the real ones.
+# ---------------------------------------------------------------------------
+
+
+def test_role_map_uses_langchain_message_classes():
+    from dspy.clients.langchain_lm import ROLE_MAP
+
+    assert ROLE_MAP["system"] is SystemMessage
+    assert ROLE_MAP["user"] is HumanMessage
+    assert ROLE_MAP["tool"] is ToolMessage

@@ -13,15 +13,22 @@ Usage::
     lc_model = ChatOpenAI(model="gpt-4o-mini")
     lm = LangChainLM(model="gpt-4o-mini", langchain_model=lc_model)
     dspy.configure(lm=lm)
+
+The class aims to be provider-agnostic: capability flags can be
+introspected from the LangChain model or supplied explicitly, and
+parameter translation is delegated to caller-supplied callables (see
+``translate_vertex`` / ``translate_azure`` / ``translate_bedrock`` for
+examples).
 """
 
+import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage as LCAIMessage
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from dspy.clients.base_lm import BaseLM
 from dspy.clients.langchain_openai_compat import langchain_to_openai_completion
@@ -33,33 +40,60 @@ ROLE_MAP = {
     "system": SystemMessage,
     "user": HumanMessage,
     "assistant": LCAIMessage,
+    "tool": ToolMessage,
 }
 
-# DSPy kwargs that should be forwarded to LangChain's .bind() at call time.
-_LANGCHAIN_BIND_PARAMS = {
-    "temperature",
-    "max_tokens",
-    "top_p",
-    "stop",
-    "n",
-    "tools",
-    "response_format",
-    "reasoning_effort",
-}
+# Default DSPy kwargs forwarded to LangChain's .bind() at call time.  Callers
+# can supply a custom set via ``LangChainLM(bind_params=...)`` to add
+# provider-specific knobs (e.g. ``reasoning_effort`` for OpenAI reasoning
+# models).
+_DEFAULT_BIND_PARAMS = frozenset(
+    {
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "stop",
+        "n",
+        "tools",
+        "response_format",
+    }
+)
+
+# Backwards-compat alias (existing callers may still import this name).
+_LANGCHAIN_BIND_PARAMS = _DEFAULT_BIND_PARAMS
+
+
+ParamTranslator = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 class LangChainLM(BaseLM):
     """DSPy LM backend using a LangChain ``BaseChatModel``.
 
     Overrides ``BaseLM.forward()`` to route calls through LangChain instead of
-    LiteLLM.  Capability properties are overridden to inform DSPy adapters
-    about what the underlying model supports (per PR #9516 interface).
+    LiteLLM.  Capability properties default to values introspected from the
+    underlying LangChain model and can be overridden via constructor args
+    (per PR #9516 interface).
 
     Args:
         model: Model identifier string (e.g. ``"vertex_ai/gemini-2.5-flash"``).
         langchain_model: A pre-configured LangChain ``BaseChatModel`` instance.
         cache: Whether to enable DSPy's request cache.
-        **kwargs: Passed through to ``BaseLM.__init__`` and stored in ``self.kwargs``.
+        supports_function_calling: If ``None``, detected via
+            ``hasattr(langchain_model, "bind_tools")``.
+        supports_response_schema: If ``None``, detected via
+            ``hasattr(langchain_model, "with_structured_output")``.
+        supports_reasoning: Whether the model emits reasoning tokens / content
+            (defaults to ``False``; callers that know the model supports it
+            should pass ``True``).
+        bind_params: Iterable of DSPy kwarg names that should be forwarded to
+            ``BaseChatModel.bind()``.  Defaults to ``_DEFAULT_BIND_PARAMS``.
+        param_translator: Optional callable that takes a dict of bind-params
+            and returns a (possibly renamed / filtered) dict suitable for the
+            underlying provider.  Useful for mapping ``max_tokens`` to
+            ``max_output_tokens`` (Vertex) or ``max_completion_tokens``
+            (Azure).  Defaults to the identity function.
+        **kwargs: Passed through to ``BaseLM.__init__`` and stored in
+            ``self.kwargs``.
     """
 
     def __init__(
@@ -67,10 +101,29 @@ class LangChainLM(BaseLM):
         model: str,
         langchain_model: BaseChatModel,
         cache: bool = True,
+        *,
+        supports_function_calling: Optional[bool] = None,
+        supports_response_schema: Optional[bool] = None,
+        supports_reasoning: bool = False,
+        bind_params: Optional[set[str]] = None,
+        param_translator: Optional[ParamTranslator] = None,
         **kwargs,
     ):
         super().__init__(model=model, cache=cache, **kwargs)
         self._langchain_model = langchain_model
+        self._supports_function_calling = (
+            supports_function_calling
+            if supports_function_calling is not None
+            else hasattr(langchain_model, "bind_tools")
+        )
+        self._supports_response_schema = (
+            supports_response_schema
+            if supports_response_schema is not None
+            else hasattr(langchain_model, "with_structured_output")
+        )
+        self._supports_reasoning = supports_reasoning
+        self._bind_params = set(bind_params) if bind_params is not None else set(_DEFAULT_BIND_PARAMS)
+        self._param_translator: ParamTranslator = param_translator or (lambda p: p)
 
     # -- Core LM interface -----------------------------------------------------
 
@@ -78,8 +131,8 @@ class LangChainLM(BaseLM):
         merged_kwargs = {**self.kwargs, **kwargs}
         lc_messages = _to_langchain_messages(messages)
 
-        bind_params = _extract_langchain_params(merged_kwargs)
-        bind_params = _translate_params_for_provider(bind_params, self.model)
+        bind_params = _extract_langchain_params(merged_kwargs, self._bind_params)
+        bind_params = self._param_translator(bind_params)
         model = self._langchain_model.bind(**bind_params) if bind_params else self._langchain_model
 
         try:
@@ -95,8 +148,8 @@ class LangChainLM(BaseLM):
         merged_kwargs = {**self.kwargs, **kwargs}
         lc_messages = _to_langchain_messages(messages)
 
-        bind_params = _extract_langchain_params(merged_kwargs)
-        bind_params = _translate_params_for_provider(bind_params, self.model)
+        bind_params = _extract_langchain_params(merged_kwargs, self._bind_params)
+        bind_params = self._param_translator(bind_params)
         model = self._langchain_model.bind(**bind_params) if bind_params else self._langchain_model
 
         try:
@@ -112,31 +165,19 @@ class LangChainLM(BaseLM):
 
     @property
     def supports_function_calling(self) -> bool:
-        return True
+        return self._supports_function_calling
 
     @property
     def supports_reasoning(self) -> bool:
-        model_lower = self.model.lower()
-        return any(
-            x in model_lower
-            for x in [
-                "o1",
-                "o3",
-                "o4",
-                "claude-sonnet-4",
-                "claude-3-7",
-                "gemini-2.5",
-                "gpt-5",
-            ]
-        )
+        return self._supports_reasoning
 
     @property
     def supports_response_schema(self) -> bool:
-        return True
+        return self._supports_response_schema
 
     @property
     def supported_params(self) -> set[str]:
-        return {"response_format", "temperature", "max_tokens", "top_p", "stop", "tools"}
+        return set(self._bind_params)
 
     # -- Serialization ---------------------------------------------------------
 
@@ -155,11 +196,16 @@ class LangChainLM(BaseLM):
             model=init_kwargs.get("model", self.model),
             langchain_model=self._langchain_model,
             cache=init_kwargs.get("cache", self.cache),
+            supports_function_calling=self._supports_function_calling,
+            supports_response_schema=self._supports_response_schema,
+            supports_reasoning=self._supports_reasoning,
+            bind_params=self._bind_params,
+            param_translator=self._param_translator,
             **new_kwargs,
         )
 
     def dump_state(self):
-        state = super().dump_state() if hasattr(super(), "dump_state") else {}
+        state = super().dump_state()
         state["model"] = self.model
         state["model_type"] = self.model_type
         return state
@@ -169,43 +215,87 @@ class LangChainLM(BaseLM):
 
 
 def _to_langchain_messages(messages: list[dict[str, Any]]) -> list:
-    """Convert DSPy message dicts to LangChain message objects."""
-    lc_messages = []
+    """Convert DSPy message dicts to LangChain message objects.
+
+    Handles ``system``/``user``/``assistant``/``tool`` roles.  Assistant
+    messages carrying ``tool_calls`` (OpenAI format) are round-tripped into
+    LangChain's unified tool-call shape on ``AIMessage.tool_calls``.
+    """
+    out = []
     for m in messages:
         role = m["role"]
-        content = m["content"]
+        content = m.get("content") or ""
+        if role == "tool":
+            out.append(ToolMessage(content=content, tool_call_id=m.get("tool_call_id", "")))
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            out.append(
+                LCAIMessage(
+                    content=content,
+                    tool_calls=[
+                        {
+                            "id": tc.get("id") or "",
+                            "name": tc["function"]["name"],
+                            "args": _loads_or_passthrough(tc["function"].get("arguments", "{}")),
+                        }
+                        for tc in m["tool_calls"]
+                    ],
+                )
+            )
+            continue
         cls = ROLE_MAP.get(role)
         if cls is None:
             raise ValueError(f"Unknown message role: {role!r}")
-        lc_messages.append(cls(content=content))
-    return lc_messages
+        out.append(cls(content=content))
+    return out
 
 
-def _extract_langchain_params(kwargs: dict[str, Any]) -> dict[str, Any]:
+def _loads_or_passthrough(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value or {}
+
+
+def _extract_langchain_params(kwargs: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
     """Extract parameters compatible with LangChain's ``.bind()`` from DSPy kwargs."""
-    return {k: v for k, v in kwargs.items() if k in _LANGCHAIN_BIND_PARAMS and v is not None}
+    return {k: v for k, v in kwargs.items() if k in allowed and v is not None}
 
 
-def _translate_params_for_provider(params: dict[str, Any], model_name: str) -> dict[str, Any]:
-    """Map generic DSPy parameter names to provider-specific names.
+# -- Built-in parameter translators -------------------------------------------
+#
+# Named helpers for common LangChain providers.  Callers compose these (or
+# supply their own) via ``LangChainLM(param_translator=...)``.
 
-    Different LangChain providers expect different parameter names:
-    - Google Gemini: ``max_output_tokens`` instead of ``max_tokens``
-    - Azure OpenAI (newer models): ``max_completion_tokens`` instead of ``max_tokens``
-    - Bedrock: does not accept ``reasoning_effort`` or ``response_format``
-      (Claude's thinking config is handled at the LangChain model level)
+
+def translate_vertex(params: dict[str, Any]) -> dict[str, Any]:
+    """Translate generic bind-params for Google Vertex (``ChatVertexAI``)."""
+    out = dict(params)
+    if "max_tokens" in out:
+        out["max_output_tokens"] = out.pop("max_tokens")
+    return out
+
+
+def translate_azure(params: dict[str, Any]) -> dict[str, Any]:
+    """Translate generic bind-params for Azure OpenAI (newer reasoning models)."""
+    out = dict(params)
+    if "max_tokens" in out:
+        out["max_completion_tokens"] = out.pop("max_tokens")
+    return out
+
+
+def translate_bedrock(params: dict[str, Any]) -> dict[str, Any]:
+    """Translate generic bind-params for AWS Bedrock chat models.
+
+    Bedrock does not accept ``reasoning_effort`` (Claude's thinking config is
+    handled at the LangChain model level) nor ``response_format``.
     """
-    params = {**params}  # shallow copy to avoid mutation
-    if model_name.startswith("vertex_ai/"):
-        if "max_tokens" in params:
-            params["max_output_tokens"] = params.pop("max_tokens")
-    elif model_name.startswith("azure/"):
-        if "max_tokens" in params:
-            params["max_completion_tokens"] = params.pop("max_tokens")
-    elif model_name.startswith("bedrock/"):
-        params.pop("reasoning_effort", None)
-        params.pop("response_format", None)
-    return params
+    out = dict(params)
+    out.pop("reasoning_effort", None)
+    out.pop("response_format", None)
+    return out
 
 
 # Pattern that matches common context-window / input-length errors across providers.

@@ -7,6 +7,7 @@ Specifically, it accesses both attribute (``response.choices``) and bracket
 we use actual ``openai.types`` Pydantic models.
 """
 
+import json
 import time
 from typing import Optional
 from uuid import uuid4
@@ -15,6 +16,7 @@ from langchain_core.messages import AIMessage
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall, Function
 from openai.types.completion_usage import CompletionTokensDetails
 
 
@@ -36,6 +38,9 @@ def langchain_to_openai_completion(message: AIMessage, model: str) -> ChatComple
         CompletionTokensDetails(reasoning_tokens=reasoning_tokens) if reasoning_tokens > 0 else None
     )
 
+    tool_calls = _extract_tool_calls(message)
+    text_content = _extract_text_content(message)
+
     completion = ChatCompletion(
         id=f"langchain-{uuid4().hex[:8]}",
         model=model,
@@ -44,10 +49,11 @@ def langchain_to_openai_completion(message: AIMessage, model: str) -> ChatComple
         choices=[
             Choice(
                 index=0,
-                finish_reason=_extract_finish_reason(message),
+                finish_reason=_extract_finish_reason(message, has_tool_calls=bool(tool_calls)),
                 message=ChatCompletionMessage(
                     role="assistant",
-                    content=_extract_text_content(message),
+                    content=text_content or None,
+                    tool_calls=tool_calls,
                 ),
             )
         ],
@@ -59,7 +65,8 @@ def langchain_to_openai_completion(message: AIMessage, model: str) -> ChatComple
         ),
     )
 
-    # DSPy reads these for cost tracking and cache detection.
+    # ``_hidden_params`` + ``cache_hit`` are read by DSPy's
+    # BaseLM._process_lm_response() for cost tracking and cache detection.
     completion._hidden_params = {}
     completion.cache_hit = False
 
@@ -96,6 +103,34 @@ def _extract_text_content(message: AIMessage) -> str:
     return ""
 
 
+def _extract_tool_calls(message: AIMessage) -> Optional[list[ChatCompletionMessageToolCall]]:
+    """Extract tool calls from a LangChain AIMessage in OpenAI format.
+
+    LangChain unifies tool calls across providers on ``AIMessage.tool_calls``
+    as ``[{"id": str, "name": str, "args": dict}, ...]``.  We translate that
+    into OpenAI's ``ChatCompletionMessageToolCall`` with a JSON-serialized
+    ``arguments`` field so DSPy's tool-using modules (ReAct, etc.) can
+    consume it directly.
+
+    Returns:
+        A list of tool-call objects, or ``None`` if the message carries none.
+    """
+    raw = getattr(message, "tool_calls", None)
+    if not raw:
+        return None
+    return [
+        ChatCompletionMessageToolCall(
+            id=tc.get("id") or f"call_{uuid4().hex[:8]}",
+            type="function",
+            function=Function(
+                name=tc["name"],
+                arguments=json.dumps(tc.get("args") or {}),
+            ),
+        )
+        for tc in raw
+    ]
+
+
 # Map provider-specific finish reason values to OpenAI-compatible ones.
 _FINISH_REASON_MAP = {
     "stop": "stop",
@@ -110,19 +145,27 @@ _FINISH_REASON_MAP = {
     "tool_calls": "tool_calls",
     "function_call": "function_call",
     "TOOL_CALLS": "tool_calls",
+    "tool_use": "tool_calls",
 }
 
 
-def _extract_finish_reason(message: AIMessage) -> str:
+def _extract_finish_reason(message: AIMessage, has_tool_calls: bool = False) -> str:
     """Extract the finish reason from a LangChain AIMessage.
 
     Different providers expose this in different locations within
     ``response_metadata`` and use different naming conventions.
-    Normalizes to OpenAI-compatible values.
+    Normalizes to OpenAI-compatible values.  When the message carries tool
+    calls and the provider did not mark it as such explicitly, coerce to
+    ``"tool_calls"`` so downstream OpenAI-shaped consumers dispatch correctly.
     """
     meta = message.response_metadata or {}
-    raw = meta.get("finish_reason") or meta.get("stop_reason") or "stop"
-    return _FINISH_REASON_MAP.get(raw, "stop")
+    raw = meta.get("finish_reason") or meta.get("stop_reason")
+    if raw is None:
+        return "tool_calls" if has_tool_calls else "stop"
+    mapped = _FINISH_REASON_MAP.get(raw, "stop")
+    if has_tool_calls and mapped == "stop":
+        return "tool_calls"
+    return mapped
 
 
 def _extract_reasoning_content(message: AIMessage) -> Optional[str]:
@@ -151,13 +194,16 @@ def _extract_reasoning_content(message: AIMessage) -> Optional[str]:
     if reasoning:
         return reasoning
 
-    # Gemini via Vertex: content blocks with type="thinking"
-    # LangChain surfaces these in content when content is a list of blocks.
+    # Gemini via Vertex: content blocks with type="thinking".  LangChain
+    # providers don't agree on whether the text lives under ``"text"``,
+    # ``"thinking"``, or ``"reasoning"``, so try all three.
     if isinstance(message.content, list):
         thinking_parts = []
         for block in message.content:
             if isinstance(block, dict) and block.get("type") == "thinking":
-                thinking_parts.append(block.get("thinking", ""))
+                text = block.get("text") or block.get("thinking") or block.get("reasoning") or ""
+                if text:
+                    thinking_parts.append(text)
         if thinking_parts:
             return "\n".join(thinking_parts)
 
