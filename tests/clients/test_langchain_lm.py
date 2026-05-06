@@ -207,12 +207,23 @@ def test_reasoning_from_claude_thinking_blocks():
             ]
         },
     )
-    assert _extract_reasoning_content(msg) == "step 1\nstep 2"
+    reasoning = _extract_reasoning_content(msg)
+    # Claude emits a full thinking trace only; no summary.
+    assert reasoning.summary is None
+    assert reasoning.full == "step 1\nstep 2"
+    # Back-compat: ``str(...)`` returns the best-available text.
+    assert str(reasoning) == "step 1\nstep 2"
 
 
 def test_reasoning_from_azure_reasoning_content():
     msg = AIMessage(content="x", additional_kwargs={"reasoning_content": "chain of thought"})
-    assert _extract_reasoning_content(msg) == "chain of thought"
+    reasoning = _extract_reasoning_content(msg)
+    # Azure's reasoning_content is treated as a summary (matches default
+    # summarized mode); callers using verbose mode still get the text
+    # in the same field.
+    assert reasoning.summary == "chain of thought"
+    assert reasoning.full is None
+    assert str(reasoning) == "chain of thought"
 
 
 def test_reasoning_from_gemini_text_block_under_thinking_type():
@@ -223,7 +234,10 @@ def test_reasoning_from_gemini_text_block_under_thinking_type():
             {"type": "thinking", "text": "inner monologue"},
         ]
     )
-    assert _extract_reasoning_content(msg) == "inner monologue"
+    reasoning = _extract_reasoning_content(msg)
+    assert reasoning.summary is None
+    assert reasoning.full == "inner monologue"
+    assert str(reasoning) == "inner monologue"
 
 
 def test_reasoning_from_gemini_legacy_thinking_key():
@@ -233,11 +247,33 @@ def test_reasoning_from_gemini_legacy_thinking_key():
             {"type": "thinking", "thinking": "legacy key"},
         ]
     )
-    assert _extract_reasoning_content(msg) == "legacy key"
+    reasoning = _extract_reasoning_content(msg)
+    assert reasoning.full == "legacy key"
+    assert str(reasoning) == "legacy key"
 
 
-def test_reasoning_returns_none_when_absent():
-    assert _extract_reasoning_content(AIMessage(content="x")) is None
+def test_reasoning_from_gemini_with_summary_and_full():
+    # Gemini 2.5+ may emit both a condensed summary and the full trace.
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "final answer"},
+            {"type": "thinking", "text": "full chain of thought"},
+        ],
+        additional_kwargs={"reasoning_summary": "brief summary"},
+    )
+    reasoning = _extract_reasoning_content(msg)
+    assert reasoning.summary == "brief summary"
+    assert reasoning.full == "full chain of thought"
+    # ``str(...)`` prefers the summary.
+    assert str(reasoning) == "brief summary"
+
+
+def test_reasoning_returns_empty_object_when_absent():
+    reasoning = _extract_reasoning_content(AIMessage(content="x"))
+    assert reasoning.summary is None
+    assert reasoning.full is None
+    assert not reasoning
+    assert str(reasoning) == ""
 
 
 def test_reasoning_content_surfaces_on_completion_message():
