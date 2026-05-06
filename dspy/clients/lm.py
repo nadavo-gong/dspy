@@ -198,7 +198,7 @@ class LM(BaseLM):
         self._check_truncation(results)
 
         if not getattr(results, "cache_hit", False) and dspy.settings.usage_tracker:
-            settings.usage_tracker.add_usage(self.model, dict(getattr(results, "usage", {})))
+            settings.usage_tracker.add_usage(self.model, dict(getattr(results, "usage", {}) or {}))
         return results
 
     async def aforward(
@@ -239,7 +239,7 @@ class LM(BaseLM):
         self._check_truncation(results)
 
         if not getattr(results, "cache_hit", False) and dspy.settings.usage_tracker:
-            settings.usage_tracker.add_usage(self.model, dict(getattr(results, "usage", {})))
+            settings.usage_tracker.add_usage(self.model, dict(getattr(results, "usage", {}) or {}))
         return results
 
     def launch(self, launch_kwargs: dict[str, Any] | None = None):
