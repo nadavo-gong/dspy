@@ -129,6 +129,8 @@ class LangChainLM(BaseLM):
 
     def forward(self, prompt=None, messages=None, **kwargs):
         merged_kwargs = {**self.kwargs, **kwargs}
+        if messages is None and prompt is not None:
+            messages = [{"role": "user", "content": prompt}]
         lc_messages = _to_langchain_messages(messages)
 
         bind_params = _extract_langchain_params(merged_kwargs, self._bind_params)
@@ -146,6 +148,8 @@ class LangChainLM(BaseLM):
 
     async def aforward(self, prompt=None, messages=None, **kwargs):
         merged_kwargs = {**self.kwargs, **kwargs}
+        if messages is None and prompt is not None:
+            messages = [{"role": "user", "content": prompt}]
         lc_messages = _to_langchain_messages(messages)
 
         bind_params = _extract_langchain_params(merged_kwargs, self._bind_params)
