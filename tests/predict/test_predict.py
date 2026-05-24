@@ -10,8 +10,12 @@ from unittest.mock import patch
 import orjson
 import pydantic
 import pytest
-from litellm import ModelResponse
 from pydantic import BaseModel, HttpUrl
+
+try:
+    from litellm import ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy import Predict, Signature

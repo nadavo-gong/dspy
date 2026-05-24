@@ -1,7 +1,11 @@
 from unittest import mock
 
 import pytest
-from litellm.utils import Choices, Message, ModelResponse
+
+try:
+    from litellm.utils import Choices, Message, ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy import ChainOfThought

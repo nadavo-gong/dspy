@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 import anyio.from_thread
 import pydantic
 import pytest
-from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+from asyncer import syncify
+
+try:
+    from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy.adapters.types import Type

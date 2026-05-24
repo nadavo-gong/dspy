@@ -4,7 +4,11 @@ from unittest import mock
 
 import pydantic
 import pytest
-from litellm.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
+
+try:
+    from litellm.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy.experimental import Citations, Document

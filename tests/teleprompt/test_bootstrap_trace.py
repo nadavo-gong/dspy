@@ -1,7 +1,12 @@
 from typing import Any
 from unittest import mock
 
-from litellm import Choices, Message, ModelResponse
+import pytest
+
+try:
+    from litellm import Choices, Message, ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy.primitives.example import Example

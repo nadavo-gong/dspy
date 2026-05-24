@@ -5,8 +5,12 @@ import threading
 from unittest.mock import patch
 
 import pytest
-from litellm import Choices, Message, ModelResponse
-from litellm.types.utils import Usage
+
+try:
+    from litellm import Choices, Message, ModelResponse
+    from litellm.types.utils import Usage
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 from dspy.primitives.prediction import Prediction

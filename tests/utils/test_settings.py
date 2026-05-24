@@ -5,7 +5,11 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import pytest
-from litellm import Choices, Message, ModelResponse
+
+try:
+    from litellm import Choices, Message, ModelResponse
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="litellm is not installed")
 
 import dspy
 
